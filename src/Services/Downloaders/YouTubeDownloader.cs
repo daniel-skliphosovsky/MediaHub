@@ -13,10 +13,12 @@ public sealed class YouTubeDownloader : IDownloader
 {
     public string PlatformName => "YouTube";
 
+    private readonly HttpClient _http;
     private readonly YoutubeClient _client;
 
     public YouTubeDownloader(HttpClient httpClient)
     {
+        _http = httpClient;
         _client = new YoutubeClient(httpClient);
     }
 
@@ -91,20 +93,18 @@ public sealed class YouTubeDownloader : IDownloader
         {
             // Stream resolution is a nice-to-have; if it fails we still have
             // the rest of the metadata, so it must not break the preview.
-            StreamManifest manifest = await _client.Videos.Streams.GetManifestAsync(video.Id, ct);
-            MuxedStreamInfo? best = manifest.GetMuxedStreams()
-                .Where(s => s.Container == Container.Mp4)
-                .MaxBy(s => s.VideoQuality);
+            YouTubeProgressiveStream? progressive =
+                await YouTubePlayback.GetProgressiveStreamAsync(_http, video.Id, ct);
 
-            quality = best is not null
-                ? $"{best.VideoQuality.Label} MP4"
-                : manifest.GetAudioOnlyStreams().Any() ? Loc.Get(LocKeys.QualityAudio) : null;
+            quality = progressive is { } stream
+                ? $"{stream.QualityLabel} MP4"
+                : Loc.Get(LocKeys.QualityAudio);
         }
         catch (Exception ex)
         {
-            // Manifest fetch is best-effort: a failure must not break the
+            // Stream lookup is best-effort: a failure must not break the
             // preview, but it should be visible in debug builds.
-            Debug.WriteLine($"Failed to fetch stream manifest: {ex}");
+            Debug.WriteLine($"Failed to fetch streams: {ex}");
         }
 
         return new MediaPreview
@@ -147,12 +147,30 @@ public sealed class YouTubeDownloader : IDownloader
             progress?.Report(new DownloadProgress(0, null, 0, Loc.Get(LocKeys.ProgressFetching)));
 
             YoutubeExplode.Videos.Video video = await _client.Videos.GetAsync(url, ct);
-            StreamManifest manifest = await _client.Videos.Streams.GetManifestAsync(video.Id, ct);
 
-            // Pick the highest-quality progressive (muxed) MP4 stream. YouTube
-            // caps muxed streams at ~720p: 1080p and above exist only as
-            // separate DASH video+audio streams that need ffmpeg muxing,
-            // which is intentionally not implemented here.
+            string name = string.IsNullOrWhiteSpace(video.Title)
+                ? video.Id
+                : $"{video.Title} - {video.Author.ChannelTitle}";
+            string sanitized = SanitizeFileName(name);
+            if (string.IsNullOrWhiteSpace(sanitized))
+                sanitized = video.Id;
+
+            // YoutubeExplode's current clients expose only adaptive streams
+            // (separate video and audio), so the muxed MP4 is read from the
+            // Android player response. It is the only source of a ready-to-play
+            // file without ffmpeg muxing.
+            YouTubeProgressiveStream? progressive =
+                await YouTubePlayback.GetProgressiveStreamAsync(_http, video.Id, ct);
+            if (progressive is { } best)
+            {
+                filePath = Path.Combine(outputPath, $"{sanitized}.mp4");
+                await DownloadProgressiveAsync(best.Url, filePath, video.Title, progress, ct);
+                return new DownloadResult(true, filePath, null);
+            }
+
+            // No progressive stream (e.g. an audio-only video): fall back to
+            // the adaptive streams of the regular manifest.
+            StreamManifest manifest = await _client.Videos.Streams.GetManifestAsync(video.Id, ct);
             IStreamInfo? streamInfo = manifest.GetMuxedStreams()
                 .Where(s => s.Container == Container.Mp4)
                 .MaxBy(s => s.VideoQuality) as IStreamInfo
@@ -161,12 +179,6 @@ public sealed class YouTubeDownloader : IDownloader
             if (streamInfo == null)
                 return new DownloadResult(false, null, Loc.Get(LocKeys.ErrNoStream));
 
-            string name = string.IsNullOrWhiteSpace(video.Title)
-                ? video.Id
-                : $"{video.Title} - {video.Author.ChannelTitle}";
-            string sanitized = SanitizeFileName(name);
-            if (string.IsNullOrWhiteSpace(sanitized))
-                sanitized = video.Id;
             filePath = Path.Combine(outputPath, $"{sanitized}.{streamInfo.Container.Name}");
             Progress<double> fileProgress = new Progress<double>(p =>
                 progress?.Report(new DownloadProgress(0, null, p, Loc.Get(LocKeys.ProgressDownloadingFile, video.Title))));
@@ -199,6 +211,31 @@ public sealed class YouTubeDownloader : IDownloader
             TryDeleteFile(filePath);
             AppLogger.Log(ex);
             return new DownloadResult(false, null, Loc.Get(LocKeys.ErrPlatformUnavailable, PlatformName));
+        }
+    }
+
+    private async Task DownloadProgressiveAsync(
+        string streamUrl, string filePath, string title,
+        IProgress<DownloadProgress>? progress, CancellationToken ct)
+    {
+        using HttpResponseMessage response = await _http.GetAsync(streamUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+
+        long? totalBytes = response.Content.Headers.ContentLength;
+        await using Stream stream = await response.Content.ReadAsStreamAsync(ct);
+        await using FileStream fileStream = File.Create(filePath);
+
+        byte[] buffer = new byte[81920];
+        long totalRead = 0;
+        int read;
+
+        while ((read = await stream.ReadAsync(buffer, ct)) > 0)
+        {
+            await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
+            totalRead += read;
+            progress?.Report(new DownloadProgress(totalRead, totalBytes,
+                totalBytes > 0 ? (double)totalRead / totalBytes : null,
+                Loc.Get(LocKeys.ProgressDownloadingFile, title)));
         }
     }
 
