@@ -80,13 +80,16 @@ jobs:
       - name: List artifacts
         run: find . -type f | sort
       - name: Delete previous release/tag
-        run: gh release delete v4.3.5 --yes --cleanup-tag 2>/dev/null || true
+        run: |
+          if gh release view v4.3.6 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete v4.3.6 --yes --cleanup-tag --repo "$GITHUB_REPOSITORY"
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v4.3.5
+          tag_name: v4.3.6
           files: |
             MediaHub-exe/*.exe
             MediaHub-macos/*
