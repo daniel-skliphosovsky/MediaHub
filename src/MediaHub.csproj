@@ -21,6 +21,13 @@
     <SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
   </PropertyGroup>
 
+  <!-- YoutubeExplode 6.6.x ships PolyShim-generated types with duplicate full
+       names, which crashes the Mac Catalyst linker with MT2231 while trimming.
+       Keep Mac Catalyst untrimmed (Windows already is). -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release' And $([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">
+    <MtouchLink>None</MtouchLink>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
     <PackageReference Include="CommunityToolkit.Maui" Version="9.0.0" />
